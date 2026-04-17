@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, get_args
 
 import streamlit as st
@@ -166,9 +167,34 @@ def _now_iso() -> str:
 
 def _init_session_state() -> None:
     st.session_state.setdefault("scenario_idx", 0)
+    st.session_state.setdefault("last_input", None)
     st.session_state.setdefault("last_result", None)
     st.session_state.setdefault("last_expected", None)
+    st.session_state.setdefault("last_result_alt", None)
+    st.session_state.setdefault("alt_user_state_diff", None)
+    st.session_state.setdefault("primary_run_version", 0)
+    st.session_state.setdefault("alt_form_initialized_for", -1)
     st.session_state.setdefault("custom_turn_ids", [])
+    st.session_state.setdefault("custom_action_type", _ACTION_TYPES[0])
+    st.session_state.setdefault(
+        "custom_parameters_json", _PARAM_PLACEHOLDERS[_ACTION_TYPES[0]]
+    )
+
+
+def _record_primary_run(decision_input: DecisionInput, result: DecisionResult | None) -> None:
+    """Store input + result and reset alt state. Call after every primary run."""
+    st.session_state["last_input"] = decision_input
+    st.session_state["last_result"] = result
+    st.session_state["last_result_alt"] = None
+    st.session_state["alt_user_state_diff"] = None
+    st.session_state["primary_run_version"] = (
+        st.session_state.get("primary_run_version", 0) + 1
+    )
+
+
+def _on_action_type_change() -> None:
+    new_action = st.session_state["custom_action_type"]
+    st.session_state["custom_parameters_json"] = _PARAM_PLACEHOLDERS.get(new_action, "{}")
 
 
 # ---------------------------------------------------------------------------
@@ -266,12 +292,12 @@ def _render_preloaded_tab() -> tuple[int, str, bool]:
 # Custom tab
 # ---------------------------------------------------------------------------
 
-def _add_custom_turn(role: str = "user", content: str = "") -> None:
+def _add_custom_turn(role: str = "user", content: str = "", timestamp: str | None = None) -> None:
     new_id = uuid.uuid4().hex[:8]
     st.session_state["custom_turn_ids"].append(new_id)
     st.session_state[f"custom_role_{new_id}"] = role
     st.session_state[f"custom_content_{new_id}"] = content
-    st.session_state[f"custom_ts_{new_id}"] = _now_iso()
+    st.session_state[f"custom_ts_{new_id}"] = timestamp or _now_iso()
 
 
 def _remove_custom_turn(turn_id: str) -> None:
@@ -281,6 +307,68 @@ def _remove_custom_turn(turn_id: str) -> None:
         st.session_state.pop(f"{prefix}{turn_id}", None)
 
 
+_TURN_LINE_RE = re.compile(
+    r"^(?:\[(?P<ts>[^\]]+)\]\s+)?(?P<role>user|alfred)\s*:\s*(?P<content>.*)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_conversation(text: str) -> list[dict[str, str]]:
+    """Parse free-form 'role: content' lines into turn dicts.
+
+    Format per turn (one per line, or multi-line for long content):
+        user: Draft an email to Acme proposing a 20% discount
+        alfred: Here's a draft...
+            continued line indented or unindented
+        [2026-04-17T14:30:00] user: Yep, send it
+
+    Optional bracketed ISO timestamp prefix overrides the auto-spacing.
+    """
+    turns: list[dict[str, str]] = []
+    current_role: str | None = None
+    current_ts: str | None = None
+    current_lines: list[str] = []
+
+    def flush() -> None:
+        if current_role is None:
+            return
+        turns.append(
+            {
+                "role": current_role,
+                "content": "\n".join(current_lines).strip(),
+                "timestamp": current_ts or "",
+            }
+        )
+
+    for raw in text.splitlines():
+        m = _TURN_LINE_RE.match(raw.strip())
+        if m:
+            flush()
+            current_role = m.group("role").lower()
+            current_ts = m.group("ts")
+            first = m.group("content")
+            current_lines = [first] if first else []
+        elif current_role and raw.strip():
+            current_lines.append(raw)
+    flush()
+
+    base = datetime.now()
+    n = len(turns)
+    for i, t in enumerate(turns):
+        if not t["timestamp"]:
+            t["timestamp"] = (base - timedelta(minutes=(n - 1 - i) * 5)).isoformat(
+                timespec="seconds"
+            )
+    return turns
+
+
+def _replace_custom_turns(parsed_turns: list[dict[str, str]]) -> None:
+    for tid in list(st.session_state["custom_turn_ids"]):
+        _remove_custom_turn(tid)
+    for t in parsed_turns:
+        _add_custom_turn(role=t["role"], content=t["content"], timestamp=t["timestamp"])
+
+
 def _render_custom_tab() -> tuple[str, bool, dict[str, Any]]:
     st.markdown("Submit any action plus context. The pipeline runs unchanged.")
 
@@ -288,6 +376,7 @@ def _render_custom_tab() -> tuple[str, bool, dict[str, Any]]:
         "Action type",
         options=_ACTION_TYPES,
         key="custom_action_type",
+        on_change=_on_action_type_change,
     )
     description = st.text_input(
         "Description",
@@ -296,19 +385,43 @@ def _render_custom_tab() -> tuple[str, bool, dict[str, Any]]:
     )
     parameters_json = st.text_area(
         "Parameters (JSON)",
-        value=st.session_state.get(
-            "custom_parameters_json", _PARAM_PLACEHOLDERS.get(action_type, "{}")
-        ),
         height=110,
         key="custom_parameters_json",
-        help="Action-dependent JSON object. Switch action type for example shapes.",
+        help="Action-dependent JSON object. Switching action type loads its example shape.",
     )
 
     st.markdown("<div class='alfred-section-label'>Conversation history</div>", unsafe_allow_html=True)
 
+    with st.expander("Paste conversation (natural language)", expanded=False):
+        st.caption(
+            "One turn per line as `role: content`. Multi-line content is supported. "
+            "Optional `[ISO timestamp]` prefix; otherwise turns are auto-spaced 5 min apart "
+            "ending at now."
+        )
+        paste_text = st.text_area(
+            "Conversation",
+            height=160,
+            key="custom_paste_text",
+            placeholder=(
+                "user: Draft a reply to Acme proposing a 20% discount\n"
+                "alfred: Here's a draft: ...\n"
+                "user: Actually hold off until legal reviews pricing language\n"
+                "alfred: Understood, I'll hold.\n"
+                "user: Yep, send it"
+            ),
+            label_visibility="collapsed",
+        )
+        if st.button("Parse and replace turns", key="custom_parse"):
+            parsed = _parse_conversation(paste_text or "")
+            if not parsed:
+                st.warning("No turns recognized. Each line should start with `user:` or `alfred:`.")
+            else:
+                _replace_custom_turns(parsed)
+                st.rerun()
+
     turn_ids = list(st.session_state["custom_turn_ids"])
     if not turn_ids:
-        st.caption("No turns yet. Add one below.")
+        st.caption("No turns yet. Paste a conversation above or add one manually.")
 
     for turn_id in turn_ids:
         cols = st.columns([1.3, 5, 2.5, 0.7])
@@ -435,6 +548,139 @@ def _render_match_badge(result: DecisionResult, expected: DecisionType) -> None:
         )
 
 
+def _user_state_diff(original: UserState, modified: UserState) -> list[str]:
+    diffs: list[str] = []
+    if original.silent_send_enabled != modified.silent_send_enabled:
+        diffs.append(
+            f"silent_send_enabled: {original.silent_send_enabled} → {modified.silent_send_enabled}"
+        )
+    if original.financial_confirmation_threshold_usd != modified.financial_confirmation_threshold_usd:
+        diffs.append(
+            f"financial_confirmation_threshold_usd: ${original.financial_confirmation_threshold_usd:,.0f}"
+            f" → ${modified.financial_confirmation_threshold_usd:,.0f}"
+        )
+    if original.preferred_calendar_autonomy != modified.preferred_calendar_autonomy:
+        diffs.append(
+            f"preferred_calendar_autonomy: {original.preferred_calendar_autonomy}"
+            f" → {modified.preferred_calendar_autonomy}"
+        )
+    if original.external_email_default != modified.external_email_default:
+        diffs.append(
+            f"external_email_default: {original.external_email_default}"
+            f" → {modified.external_email_default}"
+        )
+    return diffs
+
+
+def _render_ab_compare() -> None:
+    last_input: DecisionInput | None = st.session_state.get("last_input")
+    original_result: DecisionResult | None = st.session_state.get("last_result")
+    if last_input is None or original_result is None:
+        return
+
+    original = last_input.user_state
+    version = st.session_state["primary_run_version"]
+
+    if st.session_state.get("alt_form_initialized_for") != version:
+        st.session_state["alt_silent"] = original.silent_send_enabled
+        st.session_state["alt_threshold"] = float(original.financial_confirmation_threshold_usd)
+        st.session_state["alt_autonomy"] = original.preferred_calendar_autonomy
+        st.session_state["alt_email_default"] = original.external_email_default
+        st.session_state["alt_form_initialized_for"] = version
+
+    with st.expander("Compare with alternate user state", expanded=False):
+        st.caption(
+            "Re-run this exact action and history with a modified UserState. "
+            "Demonstrates how per-user policy changes the same decision."
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            st.toggle("silent_send_enabled", key="alt_silent")
+            st.number_input(
+                "financial_confirmation_threshold_usd",
+                min_value=0.0,
+                step=100.0,
+                key="alt_threshold",
+            )
+        with col2:
+            st.selectbox(
+                "preferred_calendar_autonomy",
+                ["low", "medium", "high"],
+                key="alt_autonomy",
+            )
+            st.selectbox(
+                "external_email_default",
+                ["confirm", "notify_after"],
+                key="alt_email_default",
+            )
+
+        if st.button("Run with these values", key="run_ab", type="primary"):
+            modified_user_state = UserState(
+                silent_send_enabled=st.session_state["alt_silent"],
+                financial_confirmation_threshold_usd=float(st.session_state["alt_threshold"]),
+                preferred_calendar_autonomy=st.session_state["alt_autonomy"],
+                external_email_default=st.session_state["alt_email_default"],
+                contacts=original.contacts,
+            )
+            modified_input = DecisionInput(
+                proposed_action=last_input.proposed_action,
+                history=last_input.history,
+                user_state=modified_user_state,
+            )
+            with st.spinner("Running with alternate user state…"):
+                try:
+                    alt_result = decide(modified_input)
+                    st.session_state["last_result_alt"] = alt_result
+                    st.session_state["alt_user_state_diff"] = _user_state_diff(
+                        original, modified_user_state
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Alt run crashed: {exc!r}")
+
+    alt_result: DecisionResult | None = st.session_state.get("last_result_alt")
+    if alt_result is None:
+        return
+
+    diff: list[str] = st.session_state.get("alt_user_state_diff") or []
+    if not diff:
+        st.caption("No fields changed — alt run is identical to original.")
+        return
+
+    st.markdown("<div class='alfred-section-label'>Comparison</div>", unsafe_allow_html=True)
+    st.markdown("**Changed fields:**")
+    for d in diff:
+        st.markdown(f"- `{d}`")
+
+    decision_changed = original_result.final_decision != alt_result.final_decision
+    if decision_changed:
+        st.markdown(
+            "<div style='color:#22C55E; font-weight:600; margin: 10px 0; "
+            "font-family: \"Fira Code\", monospace;'>"
+            f"Decision changed: {original_result.final_decision.value}"
+            f" → {alt_result.final_decision.value}"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            "<div style='color:#94A3B8; margin: 10px 0; "
+            "font-family: \"Fira Code\", monospace;'>"
+            f"Decision unchanged: {original_result.final_decision.value}"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("<div class='alfred-section-label'>Original</div>", unsafe_allow_html=True)
+        _render_decision_badge(original_result)
+        st.markdown(original_result.rationale)
+    with col_b:
+        st.markdown("<div class='alfred-section-label'>Alt</div>", unsafe_allow_html=True)
+        _render_decision_badge(alt_result)
+        st.markdown(alt_result.rationale)
+
+
 def _render_under_the_hood(result: DecisionResult) -> None:
     with st.expander("Conversation State", expanded=True):
         cs = result.conversation_state
@@ -525,6 +771,8 @@ def _render_right_column() -> None:
     if expected is not None:
         _render_match_badge(result, expected)
 
+    _render_ab_compare()
+
     st.divider()
     _render_under_the_hood(result)
 
@@ -539,10 +787,10 @@ def _run_pipeline_preloaded(scenario_idx: int, failure_sim: str) -> None:
     with st.spinner("Running decision pipeline…"):
         try:
             result = decide(scenario.input, simulate_failure=sim_value)
-            st.session_state["last_result"] = result
+            _record_primary_run(scenario.input, result)
             st.session_state["last_expected"] = scenario.expected_decision
         except Exception as exc:  # noqa: BLE001
-            st.session_state["last_result"] = None
+            _record_primary_run(scenario.input, None)
             st.session_state["last_expected"] = None
             st.error(f"Decision pipeline crashed: {exc!r}")
 
@@ -602,10 +850,10 @@ def _run_pipeline_custom(form_data: dict[str, Any], failure_sim: str) -> None:
     with st.spinner("Running decision pipeline…"):
         try:
             result = decide(decision_input, simulate_failure=sim_value)
-            st.session_state["last_result"] = result
+            _record_primary_run(decision_input, result)
             st.session_state["last_expected"] = None
         except Exception as exc:  # noqa: BLE001
-            st.session_state["last_result"] = None
+            _record_primary_run(decision_input, None)
             st.session_state["last_expected"] = None
             st.error(f"Decision pipeline crashed: {exc!r}")
 
