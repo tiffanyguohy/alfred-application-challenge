@@ -161,6 +161,17 @@ def _has_api_key() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 
+def _md_safe(text: str | None) -> str:
+    """Escape characters Streamlit's markdown parses specially.
+
+    Streamlit treats `$` as inline-LaTeX delimiters, mangling monetary amounts
+    in LLM rationales and formatted thresholds. Escape to render literally.
+    """
+    if text is None:
+        return ""
+    return text.replace("$", "\\$")
+
+
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -649,7 +660,7 @@ def _render_ab_compare() -> None:
     st.markdown("<div class='alfred-section-label'>Comparison</div>", unsafe_allow_html=True)
     st.markdown("**Changed fields:**")
     for d in diff:
-        st.markdown(f"- `{d}`")
+        st.markdown(f"- `{_md_safe(d)}`")
 
     decision_changed = original_result.final_decision != alt_result.final_decision
     if decision_changed:
@@ -674,11 +685,11 @@ def _render_ab_compare() -> None:
     with col_a:
         st.markdown("<div class='alfred-section-label'>Original</div>", unsafe_allow_html=True)
         _render_decision_badge(original_result)
-        st.markdown(original_result.rationale)
+        st.markdown(_md_safe(original_result.rationale))
     with col_b:
         st.markdown("<div class='alfred-section-label'>Alt</div>", unsafe_allow_html=True)
         _render_decision_badge(alt_result)
-        st.markdown(alt_result.rationale)
+        st.markdown(_md_safe(alt_result.rationale))
 
 
 def _render_under_the_hood(result: DecisionResult) -> None:
@@ -762,10 +773,10 @@ def _render_right_column() -> None:
     _render_decision_badge(result)
 
     st.markdown("<div class='alfred-section-label'>Rationale</div>", unsafe_allow_html=True)
-    st.markdown(result.rationale)
+    st.markdown(_md_safe(result.rationale))
 
     if result.user_facing_message:
-        st.info(f"**Message alfred_ would send:**\n\n*{result.user_facing_message}*")
+        st.info(f"**Message alfred_ would send:**\n\n*{_md_safe(result.user_facing_message)}*")
 
     expected: DecisionType | None = st.session_state.get("last_expected")
     if expected is not None:
