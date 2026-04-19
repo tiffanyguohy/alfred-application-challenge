@@ -3,13 +3,39 @@
 A 6-hour prototype of the Execution Decision Layer: given a proposed action plus conversation
 context and user state, it decides whether alfred_ should execute silently, execute and notify,
 confirm, ask a clarifying question, or refuse. The system optimizes for appropriate autonomy under
-uncertainty — over-confirming and wrong silent execution both erode trust, and the job is to tell
+uncertainty. Over-confirming and wrong silent execution both damage trust in the system, and the job of this layer is to tell
 them apart.
 
 ## Links
 
 - Live demo: https://alfred-application-challenge-uvm5bcfhrgsflkqzslznk5.streamlit.app/
 - Repo: https://github.com/tiffanyguohy/alfred-application-challenge
+
+## How to use the demo
+The app has two input modes plus an A/B comparison and a full pipeline view.
+
+- Left column — input. Two tabs: Preloaded (the eight eval scenarios) and Custom (build your own).
+- Right column — output. Decision badge, rationale, A/B compare, and collapsed expanders for every step of the pipeline.
+- Sidebar — the five decisions for reference + API key status.
+
+### Preloaded Scenario
+1. On the Preloaded tab, pick 3. ambiguous_yep_send_it. This is the canonical case from the spec: the user asked alfred_ to draft an Acme email, then said "hold off until legal reviews pricing", then a few
+  minutes later said "Yep, send it."
+2. Inspect the pre-run panels: proposed action, full history, user state.
+3. Click Run decision pipeline.
+4. The decision lands on ask_clarifying_question — the system identified an active legal hold that "Yep, send it" doesn't resolve.
+5. Open Conversation State to see the derived pending_constraints that drove the decision. Then System Prompt / User Prompt to see what the LLM received, and Raw LLM Output / Parsed LLM Decision for the response.
+
+### Custom Scenario
+1. Switch to the Custom tab.
+2. Pick an Action type. The parameters JSON template auto-fills with an example shape for that action.
+3. Open Paste conversation for fast history setup. Format: user: ... or alfred: ... per line; multi-line content supported. Click Parse and replace turns — turns are auto-spaced 5 minutes apart ending now.
+4. Optional: open User state to flip per-user toggles for this submission.
+5. Click Run decision pipeline.
+
+### A/B Comparison with alternative user states
+After any run, open Compare with alternate user state in the right column. The form is prefilled with the run's actual user state — change one field and click Run with these values. The output shows: the diff of
+changed fields, a Decision changed: X → Y line, and side-by-side decision cards with rationales. One good scenario that I have found interesting to try is the wire transfer scenario. 
 
 ## How to run locally
 
@@ -24,7 +50,7 @@ Run the eval harness: `python -m alfred.eval`.
 
 ## The decision framework
 
-Every action is placed on two axes: **intent clarity** (do we know what the user wants?) and
+Every action is classified on two axes: **intent clarity** (do we know what the user wants?) and
 **action risk** (reversibility x blast radius x sensitivity). The five decisions partition the
 grid:
 
@@ -43,23 +69,23 @@ grid:
             +--------------------+----------------------------+
 ```
 
-A hard policy violation (over financial threshold, bulk external send, missing required params on
-an irreversible action) forces the decision regardless of where the action lands on the grid.
+There are also deterministic guardrails and rules. A violation of them (over financial threshold, bulk external send, missing required params on
+an irreversible action) forces the decision regardless of the classification on the grid.
 
 ## Code / LLM split
 
-Hard rules live in code. Contextual judgment lives in the LLM. The orchestrator runs policy and
+Hard rules are in code. Contextual judgment is handed off to the LLM. The orchestrator runs policy and
 the LLM independently; if policy fires, the final decision is forced but the LLM's original output
-is still preserved in the response for transparency.
+is still preserved in the response for full transparency.
 
-**Deterministic code owns:**
+**Deterministic code includes the following:**
 - Signals: reversibility, blast radius, missing parameters, entity ambiguities, risk factors.
 - `ConversationState`: pending holds, unresolved references, last drafted artifact, awaiting confirmation.
 - Policy tripwires: financial thresholds, bulk-recipient limits, missing-params-on-irreversible.
 - Short-circuit to `ask_clarifying_question` when signals are definitive (no LLM call).
 - Fallback behavior under LLM failure, always degrading toward safety.
 
-**LLM owns:**
+**LLM includes following:**
 - Final contextual judgment given signals + state + history + user state.
 - User-facing message text for confirmations, clarifications, and refusals.
 - Soft factors: whether the latest message resolves an earlier constraint, whether emotional
@@ -85,7 +111,7 @@ load-bearing:
 - `last_drafted_artifact` — the most recent thing alfred_ drafted but did not send.
 - `awaiting_confirmation` — what alfred_ last asked the user to confirm, if anything.
 
-This is the layer that makes "Yep, send it" interpretable.
+This is the layer that makes the messages interpretable.
 
 ## User state
 
@@ -98,7 +124,7 @@ Per-user config passed in with each request:
 - `contacts` — contact list used for entity ambiguity checks.
 
 User state lets the same action produce different decisions for different users without
-hardcoding policy per user.
+hardcoding policy per user. I made this decision to include this so that the system can be personalized. 
 
 ## Prompt design
 
@@ -146,27 +172,26 @@ user state, and full history.
 
 ## Failure modes
 
-1. **LLM timeout** — `httpx` 15s timeout. Falls back to the safest option for the action's risk tier.
+1. **LLM timeout** — `httpx` 15s timeout. This falls back to the safest option for the action's risk tier.
 2. **Malformed LLM output** — Pydantic validation fails on the tool-use response; single retry with
-   a corrective system note; on second failure, fallback.
-3. **Missing critical context** — caught deterministically by signals before the LLM is called;
-   short-circuits to `ask_clarifying_question` without paying an API call.
+   a corrective system note. On the second failure, fallback.
+3. **Missing critical context** — this is caught deterministically by signals before the LLM is called,
+   which goes straight to `ask_clarifying_question` without invoking an API call.
 4. **Prompt injection inside email content** — the system prompt instructs the LLM to treat
-   external content as data, not instructions; an action traceable only to injected content is
+   external content as data instead of instructions. This means an action that is attributable only to injected content is
    refused.
 5. **Stale context after long gaps** — `pending_constraints` persist until the LLM judges them
    resolved; generic affirmations ("yep", "go ahead") do not auto-resolve a pending hold in the
    deterministic layer.
 
-## Scenarios as a seed eval set
+## Scenarios as a eval set
+I built 8 default scenarios as an eval set. 
 
-These scenarios are a seed eval set, not demo examples.
-
-Correctness here is a measurable property, not a vibe. The harness is the thing you extend with
+Correctness here is a measurable property because there are discrete actions. The harness is the thing you extend with
 red-team cases, per-user-policy variants, and production traces as the system evolves. The eight
-scenarios below capture the v1 baseline: two easy cases, two ambiguity cases, two risky cases, one
+scenarios include two easy cases, two ambiguity cases, two risky cases, one
 adversarial prompt-injection case, and one anti-over-confirmation case. Pass/fail is the expected
-decision matching the actual final decision.
+decision matching the actual final decision. The table shows the testing results, and these can be seen from the live demo. 
 
 ```text
  #  Name                                      Category          Expected                    Actual                      Source           Pass  Time(ms)  Notes
@@ -194,26 +219,17 @@ decision matching the actual final decision.
 
 - Feedback loop: when users correct a decision ("no, just send it" after a confirm), feed the
   correction back to tune per-user confirmation thresholds and emit a red-team-style regression
-  scenario into the eval set.
+  scenario into the eval set. This would probably be my priority. 
 - Per-tool trust score that ramps from `confirm` to `silent` over repeated successful executions on
   a given tool, gated on reversibility so irreversible tools never auto-promote.
 - Adversarial eval harness: a red-team case generator targeting prompt injection, stale-context
   exploits, entity confusion, and emotional-state edge cases, scored with the same harness this
-  repo already has.
+  repo already has. This would be working alongside the feedback loop to get better responses. 
 
 ## What I chose not to build — and why
 
-- Real tool execution — this is a decision layer, not a connector; execution is downstream.
-- Multi-turn clarification loops — single decision per request; the chat loop handles multi-turn.
-- Persistent session state — stateless per-request so the system is testable and reasoned about in isolation.
-- User authentication — orthogonal; the UI is a demo, not a production surface.
-- Model ensembling, chain-of-thought scaffolding, agentic flows — the decision shape is well-specified and does not benefit from reasoning chains or multi-model voting at this scope.
-- Custom frontend — Streamlit is the smallest frame that shows the under-the-hood layers.
-- Decision-replay / what-if editor — nice for debugging, not on the critical path.
-- Provenance hierarchy ("why not X") in LLM output — rationale + signals + ConversationState already surface the why; nested justification is speculative at this stage.
-- Fancy scoring math beyond lookup tables and string lists — a learned risk model is a 6-months-out project, not a 6-hour one; the simple formulation is interpretable and auditable.
+- Real tool execution 
+- Multi-turn clarification loops: single decision per request, for multi turn I handle it through multi turn conversation history. 
+- Model ensembling, chain-of-thought scaffolding, agentic flows: through testing it seemed like one model would be enough in this situation. 
+- Fancy scoring math beyond lookup tables and string lists: I thought the simple formulation is interpretable and auditable.
 
-## Acknowledgments
-
-Developed with Claude Code assistance, using strict TDD on the deterministic layer and mock-backed
-tests for the LLM wrapper. 57 tests as of v1.
